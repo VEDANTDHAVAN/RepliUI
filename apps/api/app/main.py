@@ -6,9 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from .analyzers import WebsiteAnalyzer
 from .ai import Planner
 from .generators import ProjectGenerator
-from .models.schemas import AgentState, GenerationRequest, ModificationRequest, ProjectManifest
+from .models.schemas import AgentState, GenerationRequest, ModificationRequest, ProjectManifest, ValidationError, ValidationResult
 from .storage import list_manifests, load_manifest, save_manifest, project_dir
 from .validators import BuildValidator
+from .validators import package_manager as pm
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="RepliUI API", version="0.1.0")
@@ -35,8 +36,23 @@ def pipeline(project_id: str):
         update(m, AgentState.GENERATING, "Generating independent frontend...")
         ProjectGenerator().generate(project_id, m.spec)
         update(m, AgentState.GENERATED, "✓ Project structure and component files created")
-        update(m, AgentState.VALIDATING, "Validating generated application...")
-        m.validation = BuildValidator().validate(project_id)
+        validator = BuildValidator()
+        root, inspect_failure = validator.inspect(project_id)
+        if inspect_failure is not None or root is None:
+            m.validation = inspect_failure
+            update(m, AgentState.FAILED, "Validation failed at inspect stage", "Generated project is missing required files")
+            return
+        manager = pm.detect(root)
+        update(m, AgentState.VALIDATING, f"Installing dependencies with {manager}...")
+        install = validator.install(root, manager)
+        if not install.ok:
+            m.validation = ValidationResult(success=False, stage="install", package_manager=manager, install=install, errors=install.errors or [ValidationError(message="Dependency installation failed")], stdout=install.stdout, stderr=install.stderr, duration_ms=install.duration_ms)
+            update(m, AgentState.FAILED, "✗ Dependency installation failed; build not attempted", f"`{install.command or manager}` could not install the generated project's dependencies")
+            return
+        reused = "reusing existing node_modules" if install.reused_node_modules else "dependencies installed"
+        update(m, AgentState.VALIDATING, f"✓ {reused} · building with {manager}")
+        m.validation = validator.build(root, manager)
+        m.validation.install = install
         if m.validation.success: update(m, AgentState.READY, "✓ Build validated · Ready for preview and modification")
         else: update(m, AgentState.FAILED, "Build failed; inspect diagnostics", "Generated project needs repair")
     except Exception:
@@ -68,7 +84,11 @@ async def analysis(project_id: str):
 
 @app.post("/api/projects/{project_id}/validate", response_model=ProjectManifest)
 async def validate(project_id: str):
-    m = get_project(project_id); m.validation = BuildValidator().validate(project_id); update(m, AgentState.READY if m.validation.success else AgentState.FAILED); return m
+    m = get_project(project_id)
+    update(m, AgentState.VALIDATING, "Installing dependencies and building...")
+    m.validation = BuildValidator().validate(project_id)
+    update(m, AgentState.READY if m.validation.success else AgentState.FAILED, "✓ Build validated" if m.validation.success else f"Validation failed at {m.validation.stage} stage")
+    return m
 
 @app.post("/api/projects/{project_id}/modify", response_model=ProjectManifest)
 async def modify(project_id: str, request: ModificationRequest, background_tasks: BackgroundTasks):

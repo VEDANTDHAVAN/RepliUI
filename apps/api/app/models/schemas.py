@@ -110,6 +110,21 @@ class ValidationError(BaseModel):
     message: str
 
 
+class InstallResult(BaseModel):
+    """Outcome of the dependency installation stage."""
+
+    ok: bool
+    command: str = ""
+    package_manager: str | None = None
+    # True when node_modules was already present and reused instead of reinstalling.
+    skipped: bool = False
+    reused_node_modules: bool = False
+    stdout: str = ""
+    stderr: str = ""
+    duration_ms: int = 0
+    errors: list[ValidationError] = Field(default_factory=list)
+
+
 class ValidationResult(BaseModel):
     success: bool
     stage: str
@@ -117,6 +132,8 @@ class ValidationResult(BaseModel):
     stdout: str = ""
     stderr: str = ""
     duration_ms: int = 0
+    package_manager: str | None = None
+    install: InstallResult | None = None
 
 
 class ProjectManifest(BaseModel):

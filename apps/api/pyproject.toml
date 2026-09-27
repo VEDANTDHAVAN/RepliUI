@@ -14,3 +14,15 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.54.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: performs a real dependency install and production build",
+]
