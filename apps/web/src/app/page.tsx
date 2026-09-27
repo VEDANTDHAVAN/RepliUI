@@ -1,69 +1,13 @@
-import Image from "next/image";
-
+"use client";
+import { FormEvent, useEffect, useState } from "react";
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+type Project = { project_id:string; url:string; state:string; progress:string[]; error?:string|null; validation?:{success:boolean}; modifications:string[]; updated_at:string };
 export default function Home() {
-  return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
-  );
+  const [url,setUrl]=useState(""); const [prompt,setPrompt]=useState(""); const [project,setProject]=useState<Project|null>(null); const [history,setHistory]=useState<Project[]>([]); const [busy,setBusy]=useState(false); const [message,setMessage]=useState("");
+  useEffect(()=>{fetch(`${API}/api/projects`).then(r=>r.json()).then(setHistory).catch(()=>{});},[]);
+  useEffect(()=>{if(!project||["READY","FAILED"].includes(project.state))return;const id=setInterval(()=>fetch(`${API}/api/projects/${project.project_id}`).then(r=>r.json()).then(setProject).catch(()=>{}),1200);return()=>clearInterval(id)},[project]);
+  async function create(e:FormEvent){e.preventDefault();setBusy(true);setMessage("");try{const r=await fetch(`${API}/api/projects`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});const next=await r.json();setProject(next);setHistory(h=>[next,...h])}catch{setMessage("Could not reach the API. Start FastAPI on port 8000.")}finally{setBusy(false)}}
+  async function modify(e:FormEvent){e.preventDefault();if(!project)return;setBusy(true);const r=await fetch(`${API}/api/projects/${project.project_id}/modify`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:prompt})});setProject(await r.json());setPrompt("");setBusy(false)}
+  const active=project||history[0]; const done=active?.state==="READY";
+  return <div className="shell"><header className="topbar"><div className="brand"><span className="mark">R</span><span>RepliUI</span></div><span className="pill">AI WEBSITE RECONSTRUCTION AGENT</span><div className="status-dot">● Operational</div></header><main><section className="intro"><div><p className="kicker">REBUILD THE WEB, WITH INTENT</p><h1>Turn any website<br/><em>into a starting point.</em></h1><p className="lede">RepliUI studies a public URL, extracts its visual language, and creates a clean, independent React frontend you can keep shaping.</p></div><div className="orb"><span>✦</span><small>ANALYZE<br/>GENERATE<br/>REFINE</small></div></section><form className="create" onSubmit={create}><div className="field"><label>PUBLIC WEBSITE URL</label><input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://example.com" type="url" required/><span>↗</span></div><button disabled={busy}>{busy?"Starting…":"Analyze & Generate →"}</button></form>{message&&<p className="error">{message}</p>}{active&&<section className="workspace"><div className="section-head"><div><p className="kicker">ACTIVE RECONSTRUCTION</p><h2>{active.url}</h2></div><span className={`state ${active.state.toLowerCase()}`}>{active.state}</span></div><div className="grid"><div className="card progress"><div className="card-title"><span>01</span><h3>Agent progress</h3></div>{active.progress.length?active.progress.map((p,i)=><div className="step" key={i}><b>✓</b><span>{p}</span></div>):<div className="step"><b>·</b><span>Queued</span></div>}{active.error&&<p className="error">{active.error}</p>}</div><div className="card preview"><div className="card-title"><span>02</span><h3>Generated website</h3></div><div className="preview-empty"><div className="mini-browser"><div>● ● ●</div><strong>{done?"Preview ready":"Building your frontend"}</strong><span>{done?"Independent React implementation":"This panel will be ready after validation"}</span></div></div></div></div>{done&&<form className="modify" onSubmit={modify}><div><p className="kicker">MODIFY WITH AI</p><h3>What should change?</h3></div><input value={prompt} onChange={e=>setPrompt(e.target.value)} placeholder="Make the navbar sticky…" required/><button disabled={busy}>Apply ↗</button></form>}</section>}<section className="history"><div className="section-head"><div><p className="kicker">WORKSPACE</p><h2>Recent projects</h2></div><span>{history.length} PROJECTS</span></div>{history.length===0?<p className="muted">Your generated websites will appear here.</p>:<div className="history-list">{history.slice(0,5).map(item=><button key={item.project_id} onClick={()=>setProject(item)}><span className="history-mark">◒</span><span><b>{item.url}</b><small>{item.state} · {new Date(item.updated_at).toLocaleString()}</small></span><span>→</span></button>)}</div>}</section></main><footer><span>REPLIUI / 2026</span><span>Built for independent frontends</span></footer></div>
 }
