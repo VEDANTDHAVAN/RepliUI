@@ -1,0 +1,12 @@
+{
+  "name": "repliui",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --dir apps/web dev",
+    "dev:api": "cd apps/api && .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000",
+    "build:web": "pnpm --dir apps/web build",
+    "lint": "pnpm --dir apps/web lint",
+    "typecheck": "pnpm --dir apps/web exec tsc --noEmit"
+  },
+  "packageManager": "pnpm@10.15.1"
+}
