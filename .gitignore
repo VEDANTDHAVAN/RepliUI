@@ -25,6 +25,7 @@ storage/analyses/*
 # IDE
 .vscode/
 .idea/
+.tiermux/
 
 # OS
 .DS_Store

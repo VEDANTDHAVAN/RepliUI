@@ -4,6 +4,30 @@ The Next.js dashboard submits a URL to FastAPI. A background task creates a proj
 
 The storage boundary is `generated/projects/{project_id}`. Path validation prevents project IDs from escaping that directory. The generated application contains `app/page.tsx`, `app/styles.css`, `components/Section.tsx`, `tsconfig.json`, `next-env.d.ts`, and its own package manifest.
 
+## Analysis is capture, then extract
+
+`WebsiteAnalyzer` delegates to two stages with a typed boundary between them.
+
+**Capture** runs in the browser. `analyzers/scripts.py` marks elements for correlation, walks the DOM, and collects geometry, text, assets, forms, and a fixed allowlist of computed style properties (`STYLE_PROPERTIES`). Repeated sibling groups are detected in-page, and the whole pass runs at both 1440×900 and 390×844 so responsive behaviour is observed rather than guessed. The payload is parsed into `raw_models.RawNode`.
+
+**Extraction** is pure Python over those payloads, one module per concern — `colors`, `typography`, `sections`, `components`, `responsive`, `document`, `assets`. Each is a plain function over `list[RawNode]`, so the entire extraction layer is testable without a browser.
+
+Layout has no Python module of its own. `LAYOUT_SCRIPT` in `scripts.py` detects grid and flex geometry in-page, and the result is read back out of the payload by `components.py` (grid tracks, repeated siblings) and `sections.py` (per-band `LayoutSpec`).
+
+This split is the reason the analyzer is a small orchestrator: it sequences the modules and holds no extraction logic of its own.
+
+## Section detection is geometric, and that has a sharp edge
+
+Bands are found by rectangle, not by DOM ancestry. A full-width band with children becomes a candidate, and its contained nodes come from a purely geometric test against its rectangle.
+
+The bottom and right bounds are **exclusive**. Section bands tile the page and share their edges, so an inclusive `y <= bottom` lets each band swallow the top row of the section stacked directly below it — the card grid would appear to contain the signup form that follows it.
+
+Selector prefixes cannot be used to settle this. The browser script caps a node's path at four segments (`pathOf`), which truncates the *top* of any deep node's selector, so a child's path stops being a prefix of its parent's. Truncation happens at the top; the missing part is exactly the part that would disambiguate.
+
+## Raw HTML never reaches the model
+
+The planner receives a compressed projection of the spec: theme tokens, type scale, section roles, component inventory, responsive notes. No markup is included, so page content cannot smuggle instructions into the prompt. The one AI call is made per analysis, and `build_fallback_plan` produces the same plan shape from the spec alone whenever the gateway is unconfigured, the response is unparseable, or the plan fails validation.
+
 ## Generated projects are installable by construction
 
 The generator emits a complete, self-contained Next.js 14 + React 18 + TypeScript project. `typescript` and `@types/*` are `devDependencies` because `next build` type-checks `.tsx` sources; without them the build aborts with `The "id" argument must be of type string. Received undefined`.

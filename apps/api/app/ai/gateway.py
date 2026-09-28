@@ -16,8 +16,25 @@ class LLMProvider(Protocol):
 
 
 @dataclass
+class AIGatewayCompletion:
+    """A single model response plus the usage the gateway reported, if any."""
+
+    content: str
+    model: str = ""
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: int = 0
+
+
+@dataclass
 class AIGatewayProvider:
-    """OpenAI-compatible client configured exclusively for Vercel AI Gateway."""
+    """OpenAI-compatible client configured exclusively for Vercel AI Gateway.
+
+    The key, base URL and model all come from configuration; no credential or
+    model name is hardcoded here. The model can be changed with
+    `AI_GATEWAY_MODEL` without touching any caller.
+    """
 
     api_key: str | None = None
     base_url: str = "https://ai-gateway.vercel.sh/v1"
@@ -30,6 +47,7 @@ class AIGatewayProvider:
             api_key=os.getenv("AI_GATEWAY_API_KEY"),
             base_url=os.getenv("AI_GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh/v1").rstrip("/"),
             model=os.getenv("AI_GATEWAY_MODEL", "openai/gpt-4o-mini"),
+            timeout_seconds=float(os.getenv("AI_GATEWAY_TIMEOUT", "60")),
         )
 
     @property
@@ -37,6 +55,11 @@ class AIGatewayProvider:
         return bool(self.api_key)
 
     def complete(self, *, system: str, user: str, operation: str) -> str:
+        """Backwards-compatible text-only entry point."""
+        return self.complete_detailed(system=system, user=user, operation=operation).content
+
+    def complete_detailed(self, *, system: str, user: str, operation: str) -> AIGatewayCompletion:
+        """Same call, but also returns token usage and latency for cost tracking."""
         if not self.api_key:
             raise RuntimeError("AI Gateway is not configured")
         started = time.perf_counter()
@@ -49,8 +72,18 @@ class AIGatewayProvider:
         response.raise_for_status()
         payload = response.json()
         content = payload["choices"][0]["message"]["content"]
-        self._log_usage(operation, payload, time.perf_counter() - started)
-        return content
+        usage = payload.get("usage", {}) or {}
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        completion = AIGatewayCompletion(
+            content=content,
+            model=self.model,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            latency_ms=latency_ms,
+        )
+        self._log_usage(operation, payload, latency_ms)
+        return completion
 
     def _log_usage(self, operation: str, payload: dict, latency: float) -> None:
         usage = payload.get("usage", {})

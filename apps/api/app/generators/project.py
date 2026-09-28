@@ -23,7 +23,7 @@ class ProjectGenerator:
         (root / "tsconfig.json").write_text(json.dumps(self._tsconfig(), indent=2) + "\n", encoding="utf-8")
         (root / "next-env.d.ts").write_text("/// <reference types=\"next\" />\n/// <reference types=\"next/image-types/global\" />\n", encoding="utf-8")
         (root / ".gitignore").write_text("node_modules/\n.next/\nout/\n*.tsbuildinfo\nnext-env.d.ts\n", encoding="utf-8")
-        (root / "next.config.mjs").write_text("/** @type {import('next').NextConfig} */\nconst nextConfig = {};\nexport default nextConfig;\n", encoding="utf-8")
+        (root / "next.config.mjs").write_text("/** @type {import('next').NextConfig} */\nconst nextConfig = { output: 'export' };\nexport default nextConfig;\n", encoding="utf-8")
         (root / "app/layout.tsx").write_text("import './styles.css';\nexport default function Layout({children}:{children:React.ReactNode}) { return <html lang='en'><body>{children}</body></html> }\n", encoding="utf-8")
         (root / "app/styles.css").write_text(self._css(spec), encoding="utf-8")
         (root / "components/Section.tsx").write_text("export function Section({title, text, image}:{title?:string;text?:string;image?:string}) { return <section className='section'><div><p className='eyebrow'>DISCOVER MORE</p>{title && <h2>{title}</h2>}<p>{text}</p><a className='button' href='#'>Explore →</a></div>{image && <img src={image} alt='' />}</section> }\n", encoding="utf-8")

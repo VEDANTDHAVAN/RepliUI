@@ -1,15 +1,19 @@
 from __future__ import annotations
-import logging, re, uuid
+import asyncio, logging, re, uuid
 from datetime import datetime, timezone
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from .agents import AnalysisPipeline, UserFacingError, to_user_message
 from .analyzers import WebsiteAnalyzer
-from .ai import Planner
+from .analyzers.urls import InvalidURLError, validate_url
+from .planners import Planner
 from .generators import ProjectGenerator
 from .models.schemas import AgentState, GenerationRequest, ModificationRequest, ProjectManifest, ValidationError, ValidationResult
 from .storage import list_manifests, load_manifest, save_manifest, project_dir
 from .validators import BuildValidator
 from .validators import package_manager as pm
+from .preview import preview_available, preview_url
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="RepliUI API", version="0.1.0")
@@ -27,12 +31,14 @@ def update(m: ProjectManifest, state: AgentState | None = None, message: str | N
 
 def pipeline(project_id: str):
     m = load_manifest(project_id)
+    # Resolved at call time so tests can inject a browserless analyzer / keyless planner.
+    analysis = AnalysisPipeline(analyzer=WebsiteAnalyzer(), planner=Planner())
     try:
         update(m, AgentState.ANALYZING, "Analyzing website...")
-        m.spec = WebsiteAnalyzer().analyze(m.url, project_id)
-        update(m, AgentState.ANALYZED, "✓ Website loaded · DOM, responsive layout, and assets extracted")
-        update(m, AgentState.PLANNING, "Planning reusable React components...")
-        plan = Planner().create(m.spec)
+        m.spec = asyncio.run(analysis.analyze(m.url, project_id))
+        m.plan = analysis.plan(project_id, m.spec)
+        update(m, AgentState.ANALYZED, "✓ Website loaded · DOM, computed styles, assets, and both viewports captured")
+        update(m, AgentState.PLANNING, f"✓ Plan ready ({m.plan.source} · {len(m.plan.components)} components)")
         update(m, AgentState.GENERATING, "Generating independent frontend...")
         ProjectGenerator().generate(project_id, m.spec)
         update(m, AgentState.GENERATED, "✓ Project structure and component files created")
@@ -53,8 +59,16 @@ def pipeline(project_id: str):
         update(m, AgentState.VALIDATING, f"✓ {reused} · building with {manager}")
         m.validation = validator.build(root, manager)
         m.validation.install = install
-        if m.validation.success: update(m, AgentState.READY, "✓ Build validated · Ready for preview and modification")
-        else: update(m, AgentState.FAILED, "Build failed; inspect diagnostics", "Generated project needs repair")
+        if m.validation.success:
+            # The build emits a static export; point the dashboard's sandboxed
+            # iframe at it. Absent export means the build was incomplete.
+            m.preview_url = preview_url(m.project_id) if preview_available(m.project_id) else None
+            update(m, AgentState.READY, "✓ Build validated · Ready for preview and modification")
+        else:
+            update(m, AgentState.FAILED, "Build failed; inspect diagnostics", "Generated project needs repair")
+    except UserFacingError as exc:
+        logging.info("pipeline stopped: %s", exc)
+        update(m, AgentState.FAILED, "Pipeline failed", str(exc))
     except Exception:
         logging.exception("pipeline failed")
         update(m, AgentState.FAILED, "Pipeline failed", "Could not complete the reconstruction. Check the URL and try again.")
@@ -65,7 +79,11 @@ async def health(): return {"status":"ok", "service":"repliui-api"}
 
 @app.post("/api/projects", response_model=ProjectManifest, status_code=202)
 async def create_project(request: GenerationRequest, background_tasks: BackgroundTasks):
-    m = ProjectManifest(project_id=uuid.uuid4().hex[:12], url=request.url); save_manifest(m); background_tasks.add_task(pipeline, m.project_id); return m
+    try:
+        normalized = validate_url(request.url)
+    except InvalidURLError as exc:
+        raise HTTPException(422, str(exc))
+    m = ProjectManifest(project_id=uuid.uuid4().hex[:12], url=normalized); save_manifest(m); background_tasks.add_task(pipeline, m.project_id); return m
 
 @app.get("/api/projects", response_model=list[ProjectManifest])
 async def projects(): return list_manifests()
@@ -76,18 +94,99 @@ async def project(project_id: str): return get_project(project_id)
 @app.get("/api/projects/{project_id}/status", response_model=ProjectManifest)
 async def status(project_id: str): return get_project(project_id)
 
+@app.post("/api/projects/{project_id}/analyze", response_model=ProjectManifest)
+async def analyze_project(project_id: str):
+    """Run the Playwright analyzer for an existing project and persist the spec."""
+    m = get_project(project_id)
+    analysis = AnalysisPipeline()
+    update(m, AgentState.ANALYZING, "Analyzing website...")
+    try:
+        m.spec = await analysis.analyze(m.url, project_id)
+    except UserFacingError as exc:
+        update(m, AgentState.FAILED, "Analysis failed", str(exc))
+        return m
+    update(m, AgentState.ANALYZED, "✓ Website loaded · DOM, computed styles, assets, and both viewports captured")
+    return m
+
+@app.post("/api/projects/{project_id}/plan", response_model=ProjectManifest)
+async def plan_project(project_id: str):
+    """Produce a GenerationPlan from the stored WebsiteSpec."""
+    m = get_project(project_id)
+    if not m.spec: raise HTTPException(409, "Analyze the website before planning")
+    analysis = AnalysisPipeline()
+    update(m, AgentState.PLANNING, "Planning reusable React components...")
+    try:
+        m.plan = analysis.plan(project_id, m.spec)
+    except UserFacingError as exc:
+        update(m, AgentState.FAILED, "Planning failed", str(exc))
+        return m
+    update(m, AgentState.PLANNING, f"✓ Plan ready ({m.plan.source} · {len(m.plan.components)} components)")
+    return m
+
 @app.get("/api/projects/{project_id}/analysis")
 async def analysis(project_id: str):
     m = get_project(project_id)
     if not m.spec: raise HTTPException(404, "Analysis is not ready")
     return m.spec
 
+@app.get("/api/projects/{project_id}/plan")
+async def plan(project_id: str):
+    m = get_project(project_id)
+    if not m.plan: raise HTTPException(404, "Generation plan is not ready")
+    return m.plan
+
+@app.get("/api/projects/{project_id}/preview")
+async def preview(project_id: str):
+    """Serve the project's static export as a sandboxed preview.
+
+    The dashboard embeds the returned URL in an ``<iframe>`` with a sandbox
+    attribute. Asset paths inside the prerendered HTML are rewritten to this
+    prefix so the browser can resolve ``/_next/static/...``.
+    """
+    get_project(project_id)
+    if not preview_available(project_id):
+        raise HTTPException(409, "Project has not been built; run validation first")
+    return {"url": preview_url(project_id), "prefix": "/api/projects"}
+
+
+@app.get("/api/projects/{project_id}/preview/{asset_path:path}")
+async def preview_asset(project_id: str, asset_path: str):
+    """Serve a single preview asset (the prerendered page or a chunk)."""
+    from .preview import PreviewError, serve_preview
+
+    get_project(project_id)
+    try:
+        body, content_type = serve_preview(project_id, asset_path)
+    except FileNotFoundError:
+        raise HTTPException(404, "Preview asset not found")
+    except ValueError:
+        raise HTTPException(400, "Invalid preview path")
+    except PreviewError:
+        raise HTTPException(409, "Project has not been built; run validation first")
+    return Response(content=body, media_type=content_type)
+
+
+@app.get("/api/projects/{project_id}/screenshots/{label}")
+async def project_screenshot(project_id: str, label: str):
+    """Serve a stored screenshot. Paths are resolved from the project id only."""
+    from .storage import screenshot_path
+    try:
+        path = screenshot_path(project_id, label)
+    except ValueError:
+        raise HTTPException(400, "Invalid screenshot label")
+    if not path.is_file(): raise HTTPException(404, "Screenshot not found")
+    return FileResponse(path, media_type="image/png")
+
 @app.post("/api/projects/{project_id}/validate", response_model=ProjectManifest)
 async def validate(project_id: str):
     m = get_project(project_id)
     update(m, AgentState.VALIDATING, "Installing dependencies and building...")
     m.validation = BuildValidator().validate(project_id)
-    update(m, AgentState.READY if m.validation.success else AgentState.FAILED, "✓ Build validated" if m.validation.success else f"Validation failed at {m.validation.stage} stage")
+    if m.validation.success:
+        m.preview_url = preview_url(m.project_id) if preview_available(m.project_id) else None
+        update(m, AgentState.READY, "✓ Build validated")
+    else:
+        update(m, AgentState.FAILED, f"Validation failed at {m.validation.stage} stage")
     return m
 
 @app.post("/api/projects/{project_id}/modify", response_model=ProjectManifest)

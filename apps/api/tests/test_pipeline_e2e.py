@@ -13,6 +13,7 @@ import pytest
 
 from app import main as api
 from app.models.schemas import AgentState, GenerationRequest, ProjectManifest
+from app.planners import build_fallback_plan
 from app.storage import load_manifest, save_manifest
 from app.validators import BuildValidator
 
@@ -23,13 +24,15 @@ class _StubAnalyzer:
     def __init__(self, spec_factory) -> None:
         self._spec_factory = spec_factory
 
-    def analyze(self, url: str, project_id: str):
+    async def analyze(self, url: str, project_id: str):
         return self._spec_factory()
 
 
 class _StubPlanner:
+    """Deterministic planner: the real fallback plan, no model call."""
+
     def create(self, spec):
-        return {"layout": "single-column"}
+        return build_fallback_plan(spec, source="fallback")
 
 
 @pytest.mark.slow

@@ -1,6 +1,6 @@
 # RepliUI
 
-RepliUI is an MVP AI website reconstruction agent. It loads a public URL in Playwright, compresses the DOM and visual signals into a typed `WebsiteSpec`, generates an independent React/Next.js project, validates it, and accepts targeted natural-language edits.
+RepliUI is an MVP AI website reconstruction agent. It loads a public URL in Playwright at desktop and mobile widths, reduces the captured DOM and visual signals to a typed `WebsiteSpec`, plans an independent React/Next.js project, generates it, validates it, and accepts targeted natural-language edits.
 
 ## Run locally
 
@@ -13,7 +13,9 @@ AI calls use Vercel AI Gateway through its OpenAI-compatible Chat Completions en
 
 ## Workflow
 
-URL → Playwright analysis → normalized WebsiteSpec → reusable React project → install dependencies → build → targeted modification. Generated files never iframe or proxy the source site.
+URL → Playwright capture (1440×900 and 390×844) → deterministic extraction → normalized WebsiteSpec → GenerationPlan → reusable React project → install dependencies → build → targeted modification. Generated files never iframe or proxy the source site.
+
+Extraction is pure Python over the captured payload, one module per concern, and raw HTML never reaches the model — the planner sees a compressed projection of the spec, so page content cannot smuggle instructions into the prompt.
 
 Validation is a real build, not a smoke test. A project reaches `READY` only when its production build exits zero; otherwise it stops at the `install` or `build` stage with the package manager's own output. See [docs/architecture.md](docs/architecture.md).
 
@@ -21,11 +23,13 @@ Validation is a real build, not a smoke test. A project reaches `READY` only whe
 
 ```
 cd apps/api
-uv run pytest              # full suite, includes real install + build
-uv run pytest -m "not slow"  # unit tests only
+uv run pytest                 # 167 tests, ~7 min, includes real install + build
+uv run pytest -m "not slow"   # 159 tests, ~1 min, drops the install/build E2E
 ```
 
 The suite generates a real project, installs it with a real package manager, and runs a real Next.js production build, so a green run means the lifecycle actually works. It needs `pnpm` on `PATH` and network access; tests that need it are marked `slow` and skip when no package manager is installed.
+
+Note that `-m "not slow"` still includes the browser-backed analyzer suite, which is the other slow part. See [apps/api/README.md](apps/api/README.md) for the sub-second pure-Python subset.
 
 See [docs/architecture.md](docs/architecture.md), [docs/agent.md](docs/agent.md), and [docs/demo.md](docs/demo.md).
 
