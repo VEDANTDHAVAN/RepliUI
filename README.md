@@ -13,18 +13,20 @@ AI calls use Vercel AI Gateway through its OpenAI-compatible Chat Completions en
 
 ## Workflow
 
-URL → Playwright capture (1440×900 and 390×844) → deterministic extraction → normalized WebsiteSpec → GenerationPlan → reusable React project → install dependencies → build → targeted modification. Generated files never iframe or proxy the source site.
+URL → Playwright capture (1440×900 and 390×844) → deterministic extraction → normalized WebsiteSpec → GenerationPlan → reusable React project → install dependencies → build → (bounded self-repair if it fails) → targeted modification. Generated files never iframe or proxy the source site.
 
 Extraction is pure Python over the captured payload, one module per concern, and raw HTML never reaches the model — the planner sees a compressed projection of the spec, so page content cannot smuggle instructions into the prompt.
 
 Validation is a real build, not a smoke test. A project reaches `READY` only when its production build exits zero; otherwise it stops at the `install` or `build` stage with the package manager's own output. See [docs/architecture.md](docs/architecture.md).
 
+A failed build starts a bounded self-repair: the loop parses the compiler output into diagnostics, asks the gateway for a patch, and rebuilds, at most three times. The model only proposes text — the backend applies it as validated data, refusing anything that escapes the project directory, touches a dotfile or secret-shaped file, or carries shell text. Every rebuild still goes through the validator, so repair never downgrades what `READY` means. See [docs/architecture.md](docs/architecture.md).
+
 ## Tests
 
 ```
 cd apps/api
-uv run pytest                 # 167 tests, ~7 min, includes real install + build
-uv run pytest -m "not slow"   # 159 tests, ~1 min, drops the install/build E2E
+uv run pytest                 # 287 tests; the slow set is ~8 min of real install + build
+uv run pytest -m "not slow"   # 279 tests, ~1 min, drops the install/build E2E
 ```
 
 The suite generates a real project, installs it with a real package manager, and runs a real Next.js production build, so a green run means the lifecycle actually works. It needs `pnpm` on `PATH` and network access; tests that need it are marked `slow` and skip when no package manager is installed.
@@ -35,4 +37,4 @@ See [docs/architecture.md](docs/architecture.md), [docs/agent.md](docs/agent.md)
 
 ## Limitations
 
-The current MVP uses gateway-backed structured planning with a deterministic fallback, a deterministic generator, and lightweight modification rules; provider-backed repair and managed preview process orchestration are the next extension points. Asset downloads are represented in analysis and can be added to the generator without changing the API contract. Validation installs dependencies from the public registry on every fresh project, which is slow and needs network access; a shared store or offline cache is the next optimization.
+The current MVP uses gateway-backed structured planning with a deterministic fallback, a deterministic generator, gateway-backed repair bounded to three attempts, and lightweight modification rules; managed preview process orchestration is the next extension point. Asset downloads are represented in analysis and can be added to the generator without changing the API contract. Validation installs dependencies from the public registry on every fresh project, which is slow and needs network access; a shared store or offline cache is the next optimization.

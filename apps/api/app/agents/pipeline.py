@@ -74,6 +74,11 @@ class AnalysisPipeline:
             spec = await self.analyzer.analyze(url, project_id)
         except (AnalysisError, urls.InvalidURLError, TimeoutError) as exc:
             raise UserFacingError(to_user_message(exc)) from exc
+        if not spec.sections and not spec.headings and not spec.paragraphs and not spec.navigation:
+            raise UserFacingError(
+                "The page loaded, but no usable website structure was captured. "
+                "It may require a browser challenge, login, or client-side interaction."
+            )
         save_website_spec(project_id, spec)
         return spec
 

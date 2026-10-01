@@ -1,23 +1,60 @@
 from __future__ import annotations
-import asyncio, logging, re, uuid
+import logging, uuid
 from datetime import datetime, timezone
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from .agents import AnalysisPipeline, UserFacingError, to_user_message
 from .analyzers import WebsiteAnalyzer
+from .analyzers import run_subprocess_safe
 from .analyzers.urls import InvalidURLError, validate_url
 from .planners import Planner
 from .generators import ProjectGenerator
 from .models.schemas import AgentState, GenerationRequest, ModificationRequest, ProjectManifest, ValidationError, ValidationResult
-from .storage import list_manifests, load_manifest, save_manifest, project_dir
+from .storage import list_manifests, load_manifest, save_manifest
 from .validators import BuildValidator
 from .validators import package_manager as pm
 from .preview import preview_available, preview_url
+from .modifiers import ModificationAgent
+from .repair.patch import apply_patch
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="RepliUI API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], allow_methods=["*"], allow_headers=["*"])
+
+def validate_project(project_id: str, run_repair: bool = True) -> ProjectManifest:
+    """Run the inspect → install → build validation lifecycle.
+
+    On failure, hand off to the bounded self-repair loop when one is
+    configured. The repair loop reuses this same validator; it never bypasses
+    install or build.
+    """
+    from .repair.loop import RepairLoop
+
+    m = load_manifest(project_id)
+    update(m, AgentState.VALIDATING, "Inspecting generated project")
+    m.validation = BuildValidator().validate(project_id)
+    if m.validation.success:
+        m.preview_url = preview_url(m.project_id) if preview_available(m.project_id) else None
+        update(m, AgentState.READY, "✓ Build validated")
+        return m
+
+    if not run_repair:
+        update(m, AgentState.FAILED, f"Validation failed at {m.validation.stage} stage")
+        return m
+
+    loop = RepairLoop()
+    failed = m.validation
+    m, attempts, _ = loop.run(
+        project_id, m, failed, spec=m.spec, on_progress=lambda msg: None
+    )
+    # A project that only reaches READY via repair must still be previewable;
+    # without this the repair path returned READY with no preview_url.
+    if m.state == AgentState.READY:
+        m.preview_url = preview_url(project_id) if preview_available(project_id) else None
+        update(m, None, "✓ Preview available")
+    return m
+
 
 def get_project(project_id: str) -> ProjectManifest:
     try: return load_manifest(project_id)
@@ -35,12 +72,14 @@ def pipeline(project_id: str):
     analysis = AnalysisPipeline(analyzer=WebsiteAnalyzer(), planner=Planner())
     try:
         update(m, AgentState.ANALYZING, "Analyzing website...")
-        m.spec = asyncio.run(analysis.analyze(m.url, project_id))
+        # Not asyncio.run: Playwright starts its driver as a child process,
+        # which on Windows needs a proactor loop. run_subprocess_safe pins one.
+        m.spec = run_subprocess_safe(analysis.analyze(m.url, project_id))
         m.plan = analysis.plan(project_id, m.spec)
         update(m, AgentState.ANALYZED, "✓ Website loaded · DOM, computed styles, assets, and both viewports captured")
         update(m, AgentState.PLANNING, f"✓ Plan ready ({m.plan.source} · {len(m.plan.components)} components)")
         update(m, AgentState.GENERATING, "Generating independent frontend...")
-        ProjectGenerator().generate(project_id, m.spec)
+        ProjectGenerator().generate(project_id, m.spec, m.plan, download_assets=True)
         update(m, AgentState.GENERATED, "✓ Project structure and component files created")
         validator = BuildValidator()
         root, inspect_failure = validator.inspect(project_id)
@@ -178,15 +217,12 @@ async def project_screenshot(project_id: str, label: str):
     return FileResponse(path, media_type="image/png")
 
 @app.post("/api/projects/{project_id}/validate", response_model=ProjectManifest)
-async def validate(project_id: str):
+async def validate(project_id: str, background_tasks: BackgroundTasks, run_repair: bool = True):
+    """Queue validation. The manifest is returned immediately; the dashboard
+    polls it, so inspect/install/build/repair progress stays observable."""
     m = get_project(project_id)
     update(m, AgentState.VALIDATING, "Installing dependencies and building...")
-    m.validation = BuildValidator().validate(project_id)
-    if m.validation.success:
-        m.preview_url = preview_url(m.project_id) if preview_available(m.project_id) else None
-        update(m, AgentState.READY, "✓ Build validated")
-    else:
-        update(m, AgentState.FAILED, f"Validation failed at {m.validation.stage} stage")
+    background_tasks.add_task(validate_project, project_id, run_repair)
     return m
 
 @app.post("/api/projects/{project_id}/modify", response_model=ProjectManifest)
@@ -194,8 +230,21 @@ async def modify(project_id: str, request: ModificationRequest, background_tasks
     m = get_project(project_id); update(m, AgentState.MODIFYING, "Applying targeted modification..."); background_tasks.add_task(modify_project, project_id, request.instruction); return m
 
 def modify_project(project_id: str, instruction: str):
-    m = load_manifest(project_id); root = project_dir(project_id); css = root / "app" / "styles.css"; lower = instruction.lower()
-    if "blue" in lower or "primary color" in lower:
-        css.write_text(re.sub(r"--accent:[^;]+;", "--accent:#2563eb;", css.read_text(encoding="utf-8")), encoding="utf-8")
-    if "sticky" in lower and "nav" in lower: css.write_text(css.read_text(encoding="utf-8") + "\nnav{position:sticky;top:0;background:var(--paper);z-index:5}\n", encoding="utf-8")
-    m.modifications.append(instruction); m.validation = BuildValidator().validate(project_id); update(m, AgentState.READY if m.validation.success else AgentState.FAILED, "✓ Modification validated")
+    m = load_manifest(project_id)
+    try:
+        plan = ModificationAgent().build_plan(project_id, instruction)
+        if not plan.changes:
+            update(m, AgentState.FAILED, plan.summary or "No safe modification was found", "The instruction did not map to a supported targeted edit.")
+            return
+        result = apply_patch(project_id, plan.changes)
+        if not result.ok:
+            update(m, AgentState.FAILED, "Modification rejected", "The requested edit could not be applied safely.")
+            return
+        m.modifications.append(instruction)
+        m.validation = BuildValidator().validate(project_id)
+        if m.validation.success:
+            m.preview_url = preview_url(project_id) if preview_available(project_id) else None
+        update(m, AgentState.READY if m.validation.success else AgentState.FAILED, "✓ Targeted modification validated" if m.validation.success else "Modification validation failed")
+    except Exception:
+        logging.exception("modification failed")
+        update(m, AgentState.FAILED, "Modification failed", "The requested edit could not be applied safely.")

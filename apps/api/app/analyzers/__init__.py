@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -39,6 +40,7 @@ __all__ = [
     "AnalysisError",
     "BrowserUnavailableError",
     "InaccessibleSiteError",
+    "BlockedBySiteError",
     "NavigationTimeoutError",
     "InvalidURLError",
     "VIEWPORTS",
@@ -63,6 +65,10 @@ class NavigationTimeoutError(AnalysisError):
 
 class InaccessibleSiteError(AnalysisError):
     """The URL could not be reached."""
+
+
+class BlockedBySiteError(InaccessibleSiteError):
+    """The site returned a bot-protection/interstitial page instead of content."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,11 @@ class WebsiteAnalyzer:
             raise InaccessibleSiteError("No viewport could be captured for this URL")
 
         spec = build_spec(readings, screenshots, base_url, warnings)
+        if _is_access_challenge(readings):
+            raise BlockedBySiteError(
+                "The site returned a bot-protection challenge instead of its webpage. "
+                "RepliUI cannot reconstruct content that the source site did not make available."
+            )
         spec.analysis_duration_ms = int((time.perf_counter() - started) * 1000)
         return spec
 
@@ -307,6 +318,41 @@ def build_spec(
     )
 
 
+_CHALLENGE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "verify you are human",
+    "performing security verification",
+    "enable javascript and cookies",
+    "ddos protection",
+    "attention required",
+)
+
+
+def _is_access_challenge(readings: list[ViewportReading]) -> bool:
+    """Detect common interstitials before they become misleading generated sites.
+
+    This is intentionally conservative: a marker must appear in the title or
+    visible document text, and the page must have no meaningful section
+    structure. It does not attempt to bypass the challenge.
+    """
+    for reading in readings:
+        title = reading.document.title.strip().lower()
+        visible_text = " ".join(
+            [
+                *reading.document.paragraphs,
+                *reading.document.buttons,
+                *(heading.text for heading in reading.document.headings),
+                *(node.text for node in reading.nodes if node.visible),
+            ]
+        ).lower()
+        marker_found = any(marker in title or marker in visible_text for marker in _CHALLENGE_MARKERS)
+        structural_content = len(reading.document.headings) + len(reading.document.paragraphs) + len(reading.layout.groups)
+        if marker_found and structural_content < 4:
+            return True
+    return False
+
+
 def element_cap(reading: ViewportReading) -> int:
     """The configured element budget for a reading (0 when uncapped)."""
     return reading.max_nodes
@@ -329,5 +375,43 @@ def _pick(readings: list[ViewportReading], is_mobile: bool) -> ViewportReading |
 
 
 def run(coro):
-    """Synchronous entry point for callers that are not already async."""
-    return asyncio.run(coro)
+    """Synchronous entry point for callers that are not already async.
+
+    Runs on a loop that can spawn subprocesses. See `run_subprocess_safe`.
+    """
+    return run_subprocess_safe(coro)
+
+
+def run_subprocess_safe(coro):
+    """Run `coro` to completion on a loop that supports subprocesses.
+
+    Playwright starts its driver as a child process, which on Windows is only
+    implemented by ProactorEventLoop. The default Windows policy is already a
+    proactor, but anything that swaps in a selector policy -- an embedding
+    host, a test harness, or a server started under one -- makes Playwright
+    fail with a bare `NotImplementedError` from
+    `asyncio.create_subprocess_exec`, well away from the real cause.
+
+    A fresh ProactorEventLoop is used directly rather than mutating global
+    state with `asyncio.set_event_loop_policy`, so concurrent callers are
+    unaffected. If another loop is already running in this thread the caller
+    is inside async code and should await the coroutine instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - guards misuse, not a supported path
+        raise RuntimeError(
+            "run_subprocess_safe() cannot be called from a running event loop; "
+            "await the coroutine directly instead."
+        )
+
+    if sys.platform != "win32":
+        return asyncio.run(coro)
+
+    loop = asyncio.ProactorEventLoop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()

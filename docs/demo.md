@@ -6,4 +6,6 @@
 4. Show the generated project files under `generated/projects/{id}` to demonstrate it is real frontend code, not an iframe.
 5. Use a mobile browser width to demonstrate the responsive dashboard and the generated CSS breakpoint.
 6. Submit “Make the navbar sticky” or “Change the primary color to blue” and show the revalidation status.
-7. To show that validation is not bypassed, break a generated file (for example write invalid TypeScript into `app/page.tsx`) and revalidate: the project reports `FAILED` at the `build` stage with the compiler output instead of `READY`.
+7. To show self-repair, break a generated file — write `title.length` where `title` is optional in `components/Section.tsx` — and revalidate. The dashboard shows a `SELF-REPAIR` panel with the diagnostic, the proposed change, and the rebuild; the build then passes and the project returns to `READY`.
+8. To show the limit is real, revalidate with `?run_repair=false`, or make a break the model cannot fix. After three attempts the project lands in `FAILED` with the original compiler output — repair never downgrades what `READY` means.
+9. To show the patch is validated as data, ask for a change that would escape the project: a `../` path, a `.env` edit, or replacement text containing `child_process`. It is refused, the file is untouched, and the attempt is recorded.

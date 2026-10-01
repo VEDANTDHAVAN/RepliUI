@@ -1,5 +1,21 @@
 # Architecture
 
+```text
+URL → FastAPI → Playwright Analyzer → WebsiteSpec → AI Planner
+                                      ↓             ↓
+                                 screenshots   GenerationPlan
+                                                    ↓
+                         Next.js Generator → Inspect → Install → Build
+                                                    ↓
+                                      Repair (≤3) on failure
+                                                    ↓
+                              Static Preview → Modification Agent
+                                                    ↓
+                                               Targeted Patch
+                                                    ↓
+                                               Re-validation
+```
+
 The Next.js dashboard submits a URL to FastAPI. A background task creates a project manifest, runs `WebsiteAnalyzer`, persists screenshots and the typed `WebsiteSpec`, sends the compact spec to the gateway-backed planner when configured, generates independent component files, and then runs the **inspect → install → build** validation lifecycle. Project status is persisted as JSON and polled by the dashboard.
 
 The storage boundary is `generated/projects/{project_id}`. Path validation prevents project IDs from escaping that directory. The generated application contains `app/page.tsx`, `app/styles.css`, `components/Section.tsx`, `tsconfig.json`, `next-env.d.ts`, and its own package manifest.
@@ -43,6 +59,18 @@ The generator emits a complete, self-contained Next.js 14 + React 18 + TypeScrip
 | `build` | Runs the build command, only after a successful install | `stage=build` |
 
 `node_modules` is produced by the install stage — it is never part of the generated output and is never expected from the generator.
+
+## Self-repair is a loop around the validator, not a bypass of it
+
+A failed build starts a bounded repair instead of ending the run. `RepairLoop` (`app/repair/loop.py`) takes the same `ValidationResult` the validator produced, and for at most three attempts: parse diagnostics, ask `RepairAgent` for a patch, validate and apply it, and rebuild. Every rebuild goes back through `BuildValidator`, so `READY` still means a build exited zero — repair only decides how many times to try, never whether a failure is acceptable. The loop is entered from the existing `POST /api/projects/{id}/validate` request, so polling and `preview_url` are unchanged.
+
+The split follows the rest of the codebase. `repair/diagnostics.py` is a pure function from build output to `BuildDiagnostic` records. `repair/agent.py` is the only module that talks to the gateway, and it returns a validated Pydantic change set — it never writes a file and never runs anything. `repair/patch.py` is the security boundary. `repair/loop.py` owns the attempt budget and the state machine. The agent has no way to make something happen; it can only propose text that the backend decides whether to apply.
+
+The model is shown only the files the diagnostics point at, capped at eight files and 256 KiB, with a shallow project tree for orientation. Secret-shaped files never enter a prompt.
+
+## Patches are validated as data, not as diffs
+
+A proposed change is a `file`, an `original` string, a `replacement`, and a reason. The backend resolves `file` inside the project directory and refuses dotfiles, traversal, and known-sensitive names; it refuses content carrying shell or subprocess text; and it requires `original` to appear exactly once so a patch cannot silently edit one of several identical blocks. All checks run before any write, and one bad change rejects the whole plan. A malformed model response produces an empty change set and a recorded reason, with no file touched.
 
 ## Package manager selection
 

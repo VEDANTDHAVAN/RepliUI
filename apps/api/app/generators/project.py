@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
+import mimetypes
 from pathlib import Path
 
-from ..models.schemas import WebsiteSpec
+import httpx
+
+from ..models.schemas import GenerationPlan, WebsiteSpec
 from ..storage import project_dir
 
 NEXT_VERSION = "14.2.5"
@@ -14,11 +18,13 @@ PACKAGE_MANAGER = "pnpm@10.15.1"
 
 
 class ProjectGenerator:
-    def generate(self, project_id: str, spec: WebsiteSpec) -> Path:
+    def generate(self, project_id: str, spec: WebsiteSpec, plan: GenerationPlan | None = None, download_assets: bool = False) -> Path:
         root = project_dir(project_id)
         (root / "app").mkdir(parents=True, exist_ok=True)
         (root / "components").mkdir(exist_ok=True)
         (root / "public").mkdir(exist_ok=True)
+        if download_assets:
+            self._download_assets(spec, root)
         (root / "package.json").write_text(json.dumps(self._package_json(project_id, spec), indent=2) + "\n", encoding="utf-8")
         (root / "tsconfig.json").write_text(json.dumps(self._tsconfig(), indent=2) + "\n", encoding="utf-8")
         (root / "next-env.d.ts").write_text("/// <reference types=\"next\" />\n/// <reference types=\"next/image-types/global\" />\n", encoding="utf-8")
@@ -29,7 +35,30 @@ class ProjectGenerator:
         (root / "components/Section.tsx").write_text("export function Section({title, text, image}:{title?:string;text?:string;image?:string}) { return <section className='section'><div><p className='eyebrow'>DISCOVER MORE</p>{title && <h2>{title}</h2>}<p>{text}</p><a className='button' href='#'>Explore →</a></div>{image && <img src={image} alt='' />}</section> }\n", encoding="utf-8")
         (root / "app/page.tsx").write_text(self._page(spec), encoding="utf-8")
         (root / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+        if plan is not None:
+            (root / "generation-plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
         return root
+
+    def _download_assets(self, spec: WebsiteSpec, root: Path) -> None:
+        """Best-effort localize remote assets; failures never stop generation."""
+        asset_dir = root / "public" / "assets"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        for asset in spec.assets[:20]:
+            if not asset.source_url.startswith(("http://", "https://")):
+                continue
+            try:
+                response = httpx.get(asset.source_url, timeout=8, follow_redirects=True)
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", 1)[0]
+                if not content_type.startswith(("image/", "video/")) or len(response.content) > 5 * 1024 * 1024:
+                    continue
+                extension = mimetypes.guess_extension(content_type) or Path(asset.source_url.split("?", 1)[0]).suffix or ".bin"
+                filename = hashlib.sha256(asset.source_url.encode()).hexdigest()[:16] + extension
+                (asset_dir / filename).write_bytes(response.content)
+                asset.local_path = f"/assets/{filename}"
+                asset.media_type = content_type
+            except (httpx.HTTPError, OSError):
+                continue
 
     def _package_json(self, project_id: str, spec: WebsiteSpec) -> dict:
         name = "generated-" + (re.sub(r"[^a-z0-9]+", "-", project_id.lower()).strip("-") or "app")
@@ -75,10 +104,15 @@ class ProjectGenerator:
 
     def _page(self, spec: WebsiteSpec) -> str:
         nav = "".join(f"<a href='{n.href}'>{n.label}</a>" for n in spec.navigation[:6]) or "<a href='#'>Explore</a>"
-        sections = "".join(f"<Section title={{{json.dumps(s.heading or s.name.title())}}} text={{{json.dumps(s.text)}}} />" for s in spec.sections[:8])
+        sections = "".join(self._section_markup(section, spec) for section in spec.sections[:8])
         hero = spec.headings[0] if spec.headings else spec.title
         intro = spec.paragraphs[0] if spec.paragraphs else spec.meta_description or "A thoughtful digital experience, reconstructed from the visual language of the source site."
         return "import { Section } from '../components/Section';\n\nexport default function Page() { return <main><nav><strong>{" + json.dumps(spec.title[:32]) + "}</strong><div>" + nav + "</div></nav><header className='hero'><p className='eyebrow'>REPLIUI RECONSTRUCTION</p><h1>" + hero.replace("'", "&#39;") + "</h1><p>" + intro.replace("'", "&#39;") + "</p><a className='button' href='#content'>Start exploring →</a></header><div id='content'>" + sections + "</div><footer><strong>" + spec.title[:32].replace("'", "&#39;") + "</strong><span>Independently generated frontend</span></footer></main> }\n"
+
+    def _section_markup(self, section, spec: WebsiteSpec) -> str:
+        image = next((asset.local_path for asset in spec.assets if asset.local_path and (asset.section_index is None or asset.section_index == section.order)), None)
+        image_prop = f" image={{{json.dumps(image)}}}" if image else ""
+        return f"<Section title={{{json.dumps(section.heading or section.name.title())}}} text={{{json.dumps(section.text)}}}{image_prop} />"
 
     def _css(self, spec: WebsiteSpec) -> str:
         accent = spec.theme[0].value if spec.theme else "#d97757"

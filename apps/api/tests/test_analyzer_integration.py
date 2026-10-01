@@ -317,6 +317,27 @@ def test_build_spec_is_pure_and_deterministic():
     assert first_dump == second_dump
 
 
+def test_analyzer_rejects_bot_protection_interstitials():
+    """A challenge page must not be presented as a successful reconstruction."""
+    from app.analyzers import BlockedBySiteError, _is_access_challenge
+    from app.analyzers.raw_models import RawDocument, RawLayout, ViewportReading
+
+    reading = ViewportReading(
+        device="desktop",
+        width=1440,
+        height=900,
+        is_mobile=False,
+        scale=1,
+        document=RawDocument(title="Just a moment...", paragraphs=["Checking your browser before accessing the site."]),
+        nodes=[],
+        layout=RawLayout(),
+        truncated=False,
+        document_height=900,
+    )
+    assert _is_access_challenge([reading])
+    assert issubclass(BlockedBySiteError, Exception)
+
+
 def test_a_blank_document_still_produces_a_valid_spec(storage_root, monkeypatch):
     import asyncio
 
@@ -340,6 +361,140 @@ def test_analyzer_rejects_private_urls_before_launching_a_browser():
     # A dedicated error type lets the API map this to a 400 rather than a 500.
     with pytest.raises(InvalidURLError):
         asyncio.run(WebsiteAnalyzer().analyze("https://127.0.0.1/", "ssrf0001"))
+
+
+def test_subprocess_safe_survives_a_selector_event_loop_policy():
+    """Regression: analysis died with a bare `NotImplementedError`.
+
+    Playwright starts its driver as a child process. On Windows only
+    ProactorEventLoop implements `create_subprocess_exec`, so when anything
+    installs a selector policy, `asyncio.run` handed Playwright a loop that
+    could not spawn, and the failure surfaced as `NotImplementedError` from
+    deep inside asyncio with no mention of the browser.
+    """
+    import asyncio
+    import sys
+
+    from app.analyzers import run_subprocess_safe
+
+    if sys.platform != "win32":
+        pytest.skip("SelectorEventLoop lacks subprocess support only on Windows")
+
+    async def spawn():
+        proc = await asyncio.create_subprocess_exec("cmd", "/c", "echo ok")
+        await proc.wait()
+        return proc.returncode
+
+    original = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        with pytest.raises(NotImplementedError):
+            asyncio.run(spawn())
+
+        assert run_subprocess_safe(spawn()) == 0
+    finally:
+        asyncio.set_event_loop_policy(original)
+
+
+def test_subprocess_safe_refuses_to_nest_inside_a_running_loop():
+    import asyncio
+
+    from app.analyzers import run_subprocess_safe
+
+    async def outer():
+        async def inner():
+            return 1
+
+        with pytest.raises(RuntimeError, match="running event loop"):
+            run_subprocess_safe(inner())
+        inner().close()  # never started; close to silence "was never awaited"
+
+    asyncio.run(outer())
+
+
+def test_subprocess_safe_runs_a_real_browser_under_a_selector_policy():
+    """The end of the regression: Chromium actually launches."""
+    import asyncio
+    import sys
+
+    from app.analyzers import run_subprocess_safe
+
+    if sys.platform != "win32":
+        pytest.skip("SelectorEventLoop lacks subprocess support only on Windows")
+
+    async def launch():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content("<html><body><h1>ok</h1></body></html>")
+            heading = await page.text_content("h1")
+            await browser.close()
+            return heading
+
+    original = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        assert run_subprocess_safe(launch()) == "ok"
+    finally:
+        asyncio.set_event_loop_policy(original)
+
+
+def test_pipeline_runs_the_analyzer_on_a_subprocess_safe_loop():
+    """The reported symptom was POST /api/projects -> NotImplementedError.
+
+    `main.pipeline` used `asyncio.run` for the analyzer. Playwright starts its
+    driver as a child process, and on Windows only ProactorEventLoop implements
+    `create_subprocess_exec`, so under a selector policy the request died with
+    a bare NotImplementedError and no analysis. The fix routes the analyzer
+    through `run_subprocess_safe`; this guards that wiring, which is what
+    actually regressed, without paying for a full pipeline run.
+    """
+    import inspect
+
+    import app.main as api
+
+    source = inspect.getsource(api.pipeline)
+    assert "run_subprocess_safe" in source, (
+        "main.pipeline must run the analyzer via run_subprocess_safe, not asyncio.run"
+    )
+    assert "asyncio.run(" not in source, (
+        "asyncio.run in main.pipeline cannot spawn Playwright's driver on Windows"
+    )
+
+
+def test_full_analysis_succeeds_under_a_selector_policy(monkeypatch, storage_root):
+    """End of the regression: the real analyzer returns a real spec.
+
+    Exercises the exact call main.pipeline makes -- run_subprocess_safe around
+    the analyzer coroutine -- with the real browser, under the policy that used
+    to break it. `analyze_html` avoids the network while still driving
+    Chromium exactly as the HTTP path does.
+    """
+    import asyncio
+    import sys
+
+    from app.analyzers import WebsiteAnalyzer, run_subprocess_safe
+    from app.models.schemas import WebsiteSpec
+
+    if sys.platform != "win32":
+        pytest.skip("SelectorEventLoop lacks subprocess support only on Windows")
+
+    _redirect_screenshots(monkeypatch, storage_root)
+    analyzer = WebsiteAnalyzer(max_nodes=800)
+
+    original = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        spec = run_subprocess_safe(
+            analyzer.analyze_html(FIXTURE_HTML, "https://fixture.example/", "selector0001")
+        )
+    finally:
+        asyncio.set_event_loop_policy(original)
+
+    assert isinstance(spec, WebsiteSpec)
+    assert str(spec.url).startswith("https://fixture.example/")
 
 
 def test_invalid_urlerror_is_a_distinct_api_error():

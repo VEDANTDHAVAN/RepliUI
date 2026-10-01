@@ -58,6 +58,18 @@ class AIGatewayProvider:
         """Backwards-compatible text-only entry point."""
         return self.complete_detailed(system=system, user=user, operation=operation).content
 
+    def generate(self, prompt: str, *, operation: str = "generate") -> str:
+        """Return the model's text reply to a free-form prompt.
+
+        ``operation`` is recorded in usage telemetry so repair and generation
+calls can be told apart without inspecting the prompt.
+        """
+        return self.complete_detailed(
+            system="You are a repair agent for a generated Next.js project.",
+            user=prompt,
+            operation=operation,
+        ).content
+
     def complete_detailed(self, *, system: str, user: str, operation: str) -> AIGatewayCompletion:
         """Same call, but also returns token usage and latency for cost tracking."""
         if not self.api_key:
